@@ -29,3 +29,10 @@ Imitation == 1.0.0
 [RecurrentRLHF](https://github.com/CAI23sbP/RecurrentRLHF) (Preference based RL with Recurrent reward model)
 
 [GRU_AC](https://github.com/CAI23sbP/GRU_AC) (Actor-critic or Proximal Policy Optimizer with GRU)
+
+
+## references ##
+
+BipedalWalker policy's hyper-paramter [[git repo](https://github.com/andri27-ts/Reinforcement-Learning/blob/master/Week5/PPO.py)]
+
+GRU BC reference [[git repo](https://github.com/Ram81/pirlnav)] [[paper](https://arxiv.org/pdf/2301.07302)]
