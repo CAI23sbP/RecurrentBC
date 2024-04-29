@@ -12,7 +12,11 @@ It is okay to use a expert dataset which is from human , whether it has recurren
 
 ## result in BipedalWalker-v3 ##
 
-TODO 
+BC loss (ent_weight = 1e-3 , l2_weight = 0.0)
+
+![image](https://github.com/CAI23sbP/RecurrentBC/assets/108871750/0eeba33d-1968-4971-80ca-8a73caade7cc)
+
+
 
 ## Capability ##
 
