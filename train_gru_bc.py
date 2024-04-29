@@ -66,6 +66,12 @@ origin_bc.policy.save('/home/cai/Desktop/PILRnav/bc')
 
 del rollouts, transitions
 
+policy_kwargs = dict(
+        share_features_extractor = True,
+        net_arch = dict(pi = [32,32], vf = [32,32]),
+        gru_hidden_size = 64,
+        activation_fn = nn.ReLU,
+        )
 expert_gru = GruPPO(policy='MlpGruPolicy',
              env = env,
             batch_size = 64,
@@ -94,7 +100,6 @@ recurrent_bc_ = GruBC(venv=env,
                    tensorboard_log = '/home/cai/Desktop/PILRnav/tensor_log/gru_bc')
 recurrent_bc_.train(n_epochs=5, n_batches = 32)
 recurrent_bc_.policy.save('/home/cai/Desktop/PILRnav/gru_bc')
-
 del env, rollouts, transitions
 
 
@@ -130,8 +135,8 @@ for index, agent in enumerate([expert, expert_gru, origin_bc ,recurrent_bc_]):
             else:
                 episode_starts =  np.zeros((1,),dtype=bool)
                 is_done = False
-    epi_lenghts.append(np.mean(env_record.episode_length_buffer), np.var(env_record.episode_length_buffer), np.std(env_record.episode_length_buffer))
-    epi_rewards.append(np.mean(env_record.episode_reward_buffer), np.var(env_record.episode_length_buffer), np.std(env_record.episode_length_buffer))
+    epi_lenghts.append([np.mean(env_record.episode_length_buffer), np.var(env_record.episode_length_buffer), np.std(env_record.episode_length_buffer)])
+    epi_rewards.append([np.mean(env_record.episode_reward_buffer), np.var(env_record.episode_length_buffer), np.std(env_record.episode_length_buffer)])
     del env_record
     
 import pandas as pd 
