@@ -37,6 +37,6 @@ Imitation == 1.0.0
 
 ## references ##
 
-BipedalWalker policy's hyper-paramter [[git repo](https://github.com/andri27-ts/Reinforcement-Learning/blob/master/Week5/PPO.py)]
+BipedalWalker policy's hyper-parameter [[git repo](https://github.com/andri27-ts/Reinforcement-Learning/blob/master/Week5/PPO.py)]
 
 GRU BC reference [[git repo](https://github.com/Ram81/pirlnav)] [[paper](https://arxiv.org/pdf/2301.07302)]
