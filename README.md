@@ -12,4 +12,20 @@ It is okay to use a expert dataset which is from human , whether it has recurren
 
 ## result in BipedalWalker-v3 ##
 
+TODO 
 
+## Capability ##
+
+Pytorch == 1.12.1
+
+Stable-baselines3 == 2.0.0
+
+Sb3-contrib == 2.0.o
+
+Imitation == 1.0.0
+
+## Sister GRU packages ##
+
+[RecurrentRLHF](https://github.com/CAI23sbP/RecurrentRLHF) (Preference based RL with Recurrent reward model)
+
+[GRU_AC](https://github.com/CAI23sbP/GRU_AC) (Actor-critic or Proximal Policy Optimizer with GRU)
