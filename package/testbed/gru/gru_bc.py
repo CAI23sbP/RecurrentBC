@@ -30,39 +30,8 @@ from imitation.util import logger as imit_logger
 from imitation.util import util
 from .gru_actor_critic import GruActorCriticPolicy
 
-def evaluate_actions(policy: GruActorCriticPolicy, obs: th.Tensor, actions: th.Tensor, gru_states: th.Tensor, episode_starts: th.Tensor
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-    features = policy.extract_features(obs)
-    latent_pi, gru_states = policy._process_sequence(features, gru_states, episode_starts, policy.gru)
-    latent_vf = latent_pi.detach()
-    
-    latent_pi = policy.mlp_extractor.forward_actor(latent_pi)
-    latent_vf = policy.mlp_extractor.forward_critic(latent_vf)
 
-    distribution = policy._get_action_dist_from_latent(latent_pi)
-    log_prob = distribution.log_prob(actions)
-    values = policy.value_net(latent_vf)
-    return values, log_prob, distribution.entropy(), gru_states
-import logging
-from typing import Any
-
-# Configure the Python logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-@dataclasses.dataclass(frozen=True)
-class BCTrainingMetrics:
-    """Container for the different components of behavior cloning loss."""
-
-    neglogp: th.Tensor
-    entropy: Optional[th.Tensor]
-    ent_loss: th.Tensor  # set to 0 if entropy is None
-    prob_true_act: th.Tensor
-    l2_norm: th.Tensor
-    l2_loss: th.Tensor
-    loss: th.Tensor
-
-class BCLogger:
-    """Utility class to help logging information relevant to Behavior Cloning."""
+class GruBCLogger(BCLogger):
 
     def __init__(self, logger: imit_logger.HierarchicalLogger):
         """Create new BC logger.
@@ -84,24 +53,117 @@ class BCLogger:
         self,
         batch_num: int,
         batch_size: int,
+        num_samples_so_far: int,
         training_metrics: BCTrainingMetrics,
+        rollout_stats: Mapping[str, float],
     ):
         self._logger.record("batch_size", batch_size)
         self._logger.record("bc/epoch", self._current_epoch)
         self._logger.record("bc/batch", batch_num)
+        self._logger.record("bc/samples_so_far", num_samples_so_far)
         for k, v in training_metrics.__dict__.items():
-            self._logger.record(f"bc/{k}", float(v) if v is not None else None)
-        logging.info('-'*10)
-        logging.info(f"Epoch: {self._current_epoch}, Batch: {batch_num}, Batch Size: {batch_size}")
-        for key, value in training_metrics.__dict__.items():
-            logging.info(f"{key}: {value}")
-        logging.info('-'*10)
+            if not k == 'gru_states':
+                self._logger.record(f"bc/{k}", float(v) if v is not None else None)
+
+        for k, v in rollout_stats.items():
+            if "return" in k and "monitor" not in k:
+                self._logger.record("rollout/" + k, v)
+        self._logger.dump(self._tensorboard_step)
+        self._tensorboard_step += 1
 
     def __getstate__(self):
         state = self.__dict__.copy()
         del state["_logger"]
         return state
+
+@dataclasses.dataclass(frozen=True)
+class GruBCTrainingMetrics:
+    """Container for the different components of behavior cloning loss."""
+    neglogp: th.Tensor
+    entropy: Optional[th.Tensor]
+    ent_loss: th.Tensor  # set to 0 if entropy is None
+    prob_true_act: th.Tensor
+    l2_norm: th.Tensor
+    l2_loss: th.Tensor
+    loss: th.Tensor
+    gru_states:th.Tensor
+
+def evaluate_actions(
+        policy: 
+        GruActorCriticPolicy, 
+        obs: th.Tensor, 
+        actions: th.Tensor, 
+        gru_states: th.Tensor, 
+        episode_starts: th.Tensor
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+    features = policy.extract_features(obs)
+    latent_pi, gru_states = policy._process_sequence(features, gru_states, episode_starts, policy.gru)
+    # latent_vf = latent_pi.detach()
     
+    latent_pi = policy.mlp_extractor.forward_actor(latent_pi)
+    # latent_vf = policy.mlp_extractor.forward_critic(latent_vf)
+    distribution = policy._get_action_dist_from_latent(latent_pi)
+    log_prob = distribution.log_prob(actions)
+    # values = policy.value_net(latent_vf)
+    return log_prob, log_prob, distribution.entropy(), gru_states
+
+    
+@dataclasses.dataclass(frozen=True)
+class GruBehaviorCloningLossCalculator(BehaviorCloningLossCalculator):
+    """Functor to compute the loss used in Behavior Cloning."""
+
+    ent_weight: float
+    l2_weight: float
+
+    def __call__(
+        self,
+        policy: GruActorCriticPolicy,
+        obs: Union[
+            types.AnyTensor,
+            types.DictObs,
+            Dict[str, np.ndarray],
+            Dict[str, th.Tensor],
+        ],
+        acts: Union[th.Tensor, np.ndarray],
+        gru_states: th.Tensor,
+        dones :th.Tensor,
+    ) -> GruBCTrainingMetrics:
+        tensor_obs = types.map_maybe_dict(
+            util.safe_to_tensor,
+            types.maybe_unwrap_dictobs(obs),
+        )
+        acts = util.safe_to_tensor(acts)
+        (_, log_prob, entropy, gru_states) = evaluate_actions(
+            policy,
+            tensor_obs,  # type: ignore[arg-type]
+            acts,
+            gru_states,
+            dones
+        )
+        prob_true_act = th.exp(log_prob).mean()
+        log_prob = log_prob.mean()
+        entropy = entropy.mean() if entropy is not None else None
+
+        l2_norms = [th.sum(th.square(w)) for w in policy.parameters()]
+        l2_norm = sum(l2_norms) / 2  # divide by 2 to cancel with gradient of square
+        # sum of list defaults to float(0) if len == 0.
+        assert isinstance(l2_norm, th.Tensor)
+        ent_loss = -self.ent_weight * (entropy if entropy is not None else th.zeros(1))
+        neglogp = -log_prob
+        l2_loss = self.l2_weight * l2_norm
+        loss = neglogp + ent_loss + l2_loss
+
+        return GruBCTrainingMetrics(
+            neglogp=neglogp,
+            entropy=entropy,
+            ent_loss=ent_loss,
+            prob_true_act=prob_true_act,
+            l2_norm=l2_norm,
+            l2_loss=l2_loss,
+            loss=loss,
+            gru_states = gru_states
+        )
+
 class GruBC(algo_base.DemonstrationAlgorithm):
     """
     rollout_size_init
@@ -133,13 +195,13 @@ class GruBC(algo_base.DemonstrationAlgorithm):
         1. Don't think of episode start tensor, i will add this part. 
         2. Don't consider about reset hidden state, In _process_sequence from Actor-Critic will be reset hidden state by using episode_starts
     """
-        
     def __init__(
         self,
         *,
-        venv: VecNormalize,
+        observation_space: gym.Space,
+        action_space: gym.Space,
         rng: np.random.Generator,
-        policy: GruActorCriticPolicy ,
+        policy: Optional[policies.ActorCriticPolicy] = None,
         demonstrations: Optional[algo_base.AnyTransitions] = None,
         batch_size: int = 32,
         minibatch_size: Optional[int] = None,
@@ -149,7 +211,6 @@ class GruBC(algo_base.DemonstrationAlgorithm):
         l2_weight: float = 0.0,
         device: Union[str, th.device] = "auto",
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
-        tensorboard_log: str,
     ):
         self._demo_data_loader: Optional[Iterable[types.TransitionMapping]] = None
         self.batch_size = batch_size
@@ -160,230 +221,164 @@ class GruBC(algo_base.DemonstrationAlgorithm):
             demonstrations=demonstrations,
             custom_logger=custom_logger,
         )
-        self._bc_logger = BCLogger(self.logger)
-        self.buffer_size = batch_size
-        self.ent_weight = ent_weight
-        self.l2_weight = l2_weight
-        self._policy = policy.to(utils.get_device(device))
-        self.writer = SummaryWriter(tensorboard_log)
-        self.buffer = BCBuffer(observation_space= venv.observation_space,
-                              action_space=venv.action_space,
-                              policy= self.policy,
-                              buffer_size=self.buffer_size, 
-                              n_envs = 1)
+        self._bc_logger = GruBCLogger(self.logger)
 
-        self.single_hidden_state_shape = (policy.gru.num_layers, 1, policy.gru.hidden_size)
+        self.action_space = action_space
+        self.observation_space = observation_space
+
+        self.rng = rng
+        self._policy = policy.to(utils.get_device(device))
+        assert self.policy.observation_space == self.observation_space
+        assert self.policy.action_space == self.action_space
+
+        if optimizer_kwargs:
+            if "weight_decay" in optimizer_kwargs:
+                raise ValueError("Use the parameter l2_weight instead of weight_decay.")
         optimizer_kwargs = optimizer_kwargs or {}
         self.optimizer = optimizer_cls(
             self.policy.parameters(),
             **optimizer_kwargs,
         )
-        self.current_epoch = 0
+
+        self.loss_calculator = GruBehaviorCloningLossCalculator(ent_weight, l2_weight)
+
     @property
     def policy(self) -> GruActorCriticPolicy:
         return self._policy
 
     def set_demonstrations(self, demonstrations: algo_base.AnyTransitions) -> None:
-        self.demonstrations = demonstrations
-    
+        self._demo_data_loader = algo_base.make_data_loader(
+            demonstrations,
+            self.minibatch_size,
+        )
+
     def train(
         self,
         *,
         n_epochs: Optional[int] = None,
         n_batches: Optional[int] = None,
+        on_epoch_end: Optional[Callable[[], None]] = None,
+        on_batch_end: Optional[Callable[[], None]] = None,
         log_interval: int = 500,
-
+        log_rollouts_venv: Optional[vec_env.VecEnv] = None,
+        log_rollouts_n_episodes: int = 5,
+        progress_bar: bool = True,
+        reset_tensorboard: bool = False,
     ):
-        self.interation = 0
-        self.buffer.reset()
-        self.policy.train()
-        self._bc_logger.reset_tensorboard_steps()
+        """Train with supervised learning for some number of epochs.
+
+        Here an 'epoch' is just a complete pass through the expert data loader,
+        as set by `self.set_expert_data_loader()`. Note, that when you specify
+        `n_batches` smaller than the number of batches in an epoch, the `on_epoch_end`
+        callback will never be called.
+
+        Args:
+            n_epochs: Number of complete passes made through expert data before ending
+                training. Provide exactly one of `n_epochs` and `n_batches`.
+            n_batches: Number of batches loaded from dataset before ending training.
+                Provide exactly one of `n_epochs` and `n_batches`.
+            on_epoch_end: Optional callback with no parameters to run at the end of each
+                epoch.
+            on_batch_end: Optional callback with no parameters to run at the end of each
+                batch.
+            log_interval: Log stats after every log_interval batches.
+            log_rollouts_venv: If not None, then this VecEnv (whose observation and
+                actions spaces must match `self.observation_space` and
+                `self.action_space`) is used to generate rollout stats, including
+                average return and average episode length. If None, then no rollouts
+                are generated.
+            log_rollouts_n_episodes: Number of rollouts to generate when calculating
+                rollout stats. Non-positive number disables rollouts.
+            progress_bar: If True, then show a progress bar during training.
+            reset_tensorboard: If True, then start plotting to Tensorboard from x=0
+                even if `.train()` logged to Tensorboard previously. Has no practical
+                effect if `.train()` is being called for the first time.
+        """
+        if reset_tensorboard:
+            self._bc_logger.reset_tensorboard_steps()
         self._bc_logger.log_epoch(0)
 
-        self._last_gru_states = th.zeros(self.single_hidden_state_shape, device=self.policy.device)
-        gru_states = deepcopy(self._last_gru_states)
-        for index ,demon_info in enumerate(self.demonstrations):
-            obs = util.safe_to_tensor(demon_info['obs'], device=self.policy.device)[None]
-            acts = util.safe_to_tensor(demon_info['acts'], device=self.policy.device)[None]
-            dones = util.safe_to_tensor(demon_info['dones'], device=self.policy.device).to(dtype=th.float)[None]
-            self.buffer.insert(demon_info['obs'][None], demon_info['acts'][None], gru_states, demon_info['dones'][None])
-            _, _, _, gru_states = self.policy.forward(obs, gru_states, dones)
-            self._last_gru_states = gru_states
-            if (index +1) % self.buffer_size == 0 :
-                self.learn(n_epochs, n_batches, log_interval)
-                
-        self.writer.close()
-
-    def learn(self, n_epochs, n_batches, log_interval):
-        for epoch in range(n_epochs):
-            self.current_epoch += epoch
-            self._bc_logger.log_epoch(epoch + 1)
-            for batch_num ,rollout_data in enumerate(self.buffer.get(n_batches)):
-                _ ,log_prob, entropy, _ = evaluate_actions(self.policy,
-                                                            rollout_data.observations,
-                                                            rollout_data.actions,
-                                                            rollout_data.recurrent_hidden_states,
-                                                            rollout_data.episode_starts)
-                prob_true_act = th.exp(log_prob).mean()
-                log_prob = log_prob.mean()
-                
-                entropy = entropy.mean() if entropy is not None else None
-                l2_norms = [th.sum(th.square(w)) for w in self.policy.parameters()]
-                l2_norm = sum(l2_norms) / 2  # divide by 2 to cancel with gradient of square
-                ent_loss = -self.ent_weight * (entropy if entropy is not None else th.zeros(1))
-                neglogp = -log_prob
-                l2_loss = self.l2_weight * l2_norm
-                loss = neglogp + ent_loss + l2_loss
-                training_metrics = BCTrainingMetrics(neglogp=neglogp, 
-                                  entropy=entropy,
-                                  prob_true_act=prob_true_act,
-                                  ent_loss=ent_loss,
-                                  l2_norm=l2_norm,
-                                  l2_loss=l2_loss,
-                                  loss=loss
-                                  )
-                if self.current_epoch % log_interval == 0:
-                    self._bc_logger.log_batch(
-                        batch_num = batch_num,
-                        batch_size = self.minibatch_size,
-                        training_metrics= training_metrics,
-                    )
-                loss.backward()
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                self.writer.add_scalar('GRU_BC/Loss',loss.item(), self.interation)
-                self.interation += 1
-
-class GruRolloutBufferSamples(NamedTuple):
-    observations: th.Tensor
-    actions: th.Tensor
-    recurrent_hidden_states: th.Tensor
-    episode_starts: th.Tensor
-
-class BCBuffer():
-    def __init__(self, observation_space:gym.spaces, action_space:gym.spaces, policy, buffer_size: int, n_envs: int):
-        self.observation_space = observation_space
-        self.obs_shape = get_obs_shape(observation_space)
-        self.action_dim = get_action_dim(action_space)
-        gru = policy.gru
-        self.device  = policy.device
-        self.n_envs = n_envs
-        self.hidden_state_shape = (buffer_size, gru.num_layers, self.n_envs, gru.hidden_size)
-        self.buffer_size = buffer_size
-        self.pos = 0
-        self.recu_pos = 0
-        self.full = False
-        self.recu_full = False
-        self.generator_ready = False
-
-    def reset(self):
-        self.observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=np.float32)
-        self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
-        self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
-        self.recurrent_hidden_states = np.zeros(self.hidden_state_shape, dtype=np.float32)
-        self.pos = 0
-        self.full = False
-        self.generator_ready = False
-
-    def insert(self, obs, action, hidden_state, episode_starts):
-        if isinstance(self.observation_space, gym.spaces.Discrete):
-            obs = obs.reshape((self.n_envs, *self.obs_shape))
-
-        action = action.reshape((self.n_envs, self.action_dim))
-        self.observations[self.pos] = np.array(obs)
-        self.actions[self.pos] = np.array(action)
-        self.episode_starts[self.pos] = np.array(episode_starts)
-        self.recurrent_hidden_states[self.pos] = np.array(hidden_state.detach().cpu().numpy())
-        self.pos += 1
-        if self.pos == self.buffer_size:
-            self.full = True
-            self.pos = 0
-
-    def get(self, batch_size: Optional[int] = None) -> Generator[GruRolloutBufferSamples, None, None]:
-        assert self.full, "Rollout buffer must be full before sampling from it"
-        # Prepare the data
-        if not self.generator_ready:
-            self.__dict__['recurrent_hidden_states'] = self.__dict__['recurrent_hidden_states'].swapaxes(1, 2)
-
-            for tensor in [
-                "observations",
-                "actions",
-                "recurrent_hidden_states",
-                "episode_starts",
-            ]:
-                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor]) #
-            self.generator_ready = True
-
-        if batch_size is None:
-            batch_size = self.buffer_size * self.n_envs
-
-        split_index = np.random.randint(self.buffer_size * self.n_envs)
-        indices = np.arange(self.buffer_size * self.n_envs)
-        indices = np.concatenate((indices[split_index:], indices[:split_index]))
-        env_change = np.zeros(self.buffer_size * self.n_envs).reshape(self.buffer_size, self.n_envs)
-        # Flag first timestep as change of environment
-        env_change[0, :] = 1.0
-        env_change = self.swap_and_flatten(env_change)
-        start_idx = 0
-        while start_idx < self.buffer_size * self.n_envs:
-            batch_inds = indices[start_idx : start_idx + batch_size]
-            yield self._get_samples(batch_inds, env_change)
-            start_idx += batch_size
-
-    @staticmethod
-    def swap_and_flatten(arr: np.ndarray) -> np.ndarray:
-        """
-        Swap and then flatten axes 0 (buffer_size) and 1 (n_envs)
-        to convert shape from [n_steps, n_envs, ...] (when ... is the shape of the features)
-        to [n_steps * n_envs, ...] (which maintain the order)
-
-        :param arr:
-        :return:
-        """
-        shape = arr.shape
-        if len(shape) < 3:
-            shape = (*shape, 1)
-        return arr.swapaxes(0, 1).reshape(shape[0] * shape[1], *shape[2:])
-
-    def to_torch(self, array: np.ndarray, copy: bool = True) -> th.Tensor:
-        """
-        Convert a numpy array to a PyTorch tensor.
-        Note: it copies the data by default
-
-        :param array:
-        :param copy: Whether to copy or not the data (may be useful to avoid changing things
-            by reference). This argument is inoperative if the device is not the CPU.
-        :return:
-        """
-        if copy:
-            return th.tensor(array, device=self.device)
-        return th.as_tensor(array, device=self.device)
-
-
-    def _get_samples(
-        self,
-        batch_inds: np.ndarray,
-        env_change: np.ndarray,
-        env: Optional[VecNormalize] = None,
-    ) -> GruRolloutBufferSamples:
-        # Retrieve sequence starts and utility function
-        self.seq_start_indices, self.pad, self.pad_and_flatten = create_sequencers(
-            self.episode_starts[batch_inds], env_change[batch_inds], self.device
+        compute_rollout_stats = RolloutStatsComputer(
+            log_rollouts_venv,
+            log_rollouts_n_episodes,
         )
 
-        # Number of sequences
-        n_seq = len(self.seq_start_indices)
-        max_length = self.pad(self.actions[batch_inds]).shape[1]
-        padded_batch_size = n_seq * max_length
-        # We retrieve the gru hidden states that will allow
-        # to properly initialize the GRU at the beginning of each sequence
-        recurrent_hidden_states = self.recurrent_hidden_states[batch_inds][self.seq_start_indices].swapaxes(0, 1)
-        recurrent_hidden_states = self.to_torch(recurrent_hidden_states).contiguous()
+        def _on_epoch_end(epoch_number: int):
+            if tqdm_progress_bar is not None:
+                total_num_epochs_str = f"of {n_epochs}" if n_epochs is not None else ""
+                tqdm_progress_bar.display(
+                    f"Epoch {epoch_number} {total_num_epochs_str}",
+                    pos=1,
+                )
+            self._bc_logger.log_epoch(epoch_number + 1)
+            if on_epoch_end is not None:
+                on_epoch_end()
 
-        return GruRolloutBufferSamples(
-            # (batch_size, obs_dim) -> (n_seq, max_length, obs_dim) -> (n_seq * max_length, obs_dim)
-            observations=self.pad(self.observations[batch_inds]).reshape((padded_batch_size, *self.obs_shape)),
-            actions=self.pad(self.actions[batch_inds]).reshape((padded_batch_size,) + self.actions.shape[1:]),
-            recurrent_hidden_states= recurrent_hidden_states,
-            episode_starts=self.pad_and_flatten(self.episode_starts[batch_inds]),
+        mini_per_batch = self.batch_size // self.minibatch_size
+        n_minibatches = n_batches * mini_per_batch if n_batches is not None else None
+
+        assert self._demo_data_loader is not None
+        demonstration_batches = BatchIteratorWithEpochEndCallback(
+            self._demo_data_loader,
+            n_epochs,
+            n_minibatches,
+            _on_epoch_end,
         )
+        batches_with_stats = enumerate_batches(demonstration_batches)
+        tqdm_progress_bar: Optional[tqdm.tqdm] = None
+
+        if progress_bar:
+            batches_with_stats = tqdm.tqdm(
+                batches_with_stats,
+                unit="batch",
+                total=n_minibatches,
+            )
+            
+            tqdm_progress_bar = batches_with_stats
+
+        def process_batch():
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+            if batch_num % log_interval == 0:
+                rollout_stats = compute_rollout_stats(self.policy, self.rng)
+                self._bc_logger.log_batch(
+                    batch_num,
+                    minibatch_size,
+                    num_samples_so_far,
+                    training_metrics,
+                    rollout_stats,
+                )
+
+            if on_batch_end is not None:
+                on_batch_end()
+        gru_states = np.concatenate([np.zeros(self.policy.gru_hidden_state_shape) for _ in range(self.batch_size)], axis=1)
+        gru_states = util.safe_to_tensor(gru_states, device=self.policy.device).float()
+        self.policy.set_training_mode(True)
+        self.optimizer.zero_grad()
+        for (
+            batch_num,
+            minibatch_size,
+            num_samples_so_far,
+        ), batch in batches_with_stats:
+            obs_tensor: Union[th.Tensor, Dict[str, th.Tensor]]
+            # unwraps the observation if it's a dictobs and converts arrays to tensors
+            obs_tensor = types.map_maybe_dict(
+                lambda x: util.safe_to_tensor(x, device=self.policy.device),
+                types.maybe_unwrap_dictobs(batch["obs"]),
+            )
+            acts = util.safe_to_tensor(batch["acts"], device=self.policy.device)
+            dones = util.safe_to_tensor(batch['dones'].float(), device=self.policy.device)
+            training_metrics = self.loss_calculator(self.policy, obs_tensor, acts, gru_states, dones)
+            loss = training_metrics.loss * minibatch_size / self.batch_size
+            loss.backward()
+            gru_states = training_metrics.gru_states.detach()
+
+            batch_num = batch_num * self.minibatch_size // self.batch_size
+            if num_samples_so_far % self.batch_size == 0:
+                process_batch()
+        if num_samples_so_far % self.batch_size != 0:
+            # if there remains an incomplete batch
+            batch_num += 1
+            process_batch()
+
