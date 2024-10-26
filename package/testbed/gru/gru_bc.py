@@ -1,12 +1,10 @@
 
 import dataclasses
-import itertools
 from typing import (
     Any,
     Callable,
     Dict,
     Iterable,
-    Iterator,
     Mapping,
     Optional,
     Tuple,
@@ -14,40 +12,24 @@ from typing import (
     Union,
 )
 
-from stable_baselines3.common.vec_env import VecNormalize
-from typing import NamedTuple, Generator
-from sb3_contrib.common.recurrent.buffers import create_sequencers
-from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
+from stable_baselines3.common import policies, utils, vec_env
 import gymnasium as gym
 import numpy as np
 import torch as th
-from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common import utils
-from copy import deepcopy
 from imitation.algorithms import base as algo_base
 from imitation.data import types
 from imitation.util import logger as imit_logger
 from imitation.util import util
-from .gru_actor_critic import GruActorCriticPolicy
-
+from imitation.algorithms.bc import BehaviorCloningLossCalculator, BCTrainingMetrics, BatchIteratorWithEpochEndCallback, enumerate_batches, RolloutStatsComputer, BCLogger
+from drl_utils.algorithms.gru_ppo.gru_actor_critic import GruActorCriticPolicy
+import tqdm  
+from drl_utils.algorithms.behavioral_clonings.bc import make_data_loader
 
 class GruBCLogger(BCLogger):
 
     def __init__(self, logger: imit_logger.HierarchicalLogger):
-        """Create new BC logger.
-
-        Args:
-            logger: The logger to feed all the information to.
-        """
-        self._logger = logger
-        self._tensorboard_step = 0
-        self._current_epoch = 0
-
-    def reset_tensorboard_steps(self):
-        self._tensorboard_step = 0
-
-    def log_epoch(self, epoch_number):
-        self._current_epoch = epoch_number
+        super().__init__(logger)
 
     def log_batch(
         self,
@@ -71,10 +53,6 @@ class GruBCLogger(BCLogger):
         self._logger.dump(self._tensorboard_step)
         self._tensorboard_step += 1
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        del state["_logger"]
-        return state
 
 @dataclasses.dataclass(frozen=True)
 class GruBCTrainingMetrics:
@@ -89,23 +67,20 @@ class GruBCTrainingMetrics:
     gru_states:th.Tensor
 
 def evaluate_actions(
-        policy: 
-        GruActorCriticPolicy, 
-        obs: th.Tensor, 
-        actions: th.Tensor, 
-        gru_states: th.Tensor, 
-        episode_starts: th.Tensor
+    policy: GruActorCriticPolicy, 
+    obs: th.Tensor, 
+    actions: th.Tensor, 
+    gru_states: th.Tensor, 
+    episode_starts: th.Tensor
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
     features = policy.extract_features(obs)
     latent_pi, gru_states = policy._process_sequence(features, gru_states, episode_starts, policy.gru)
-    # latent_vf = latent_pi.detach()
-    
     latent_pi = policy.mlp_extractor.forward_actor(latent_pi)
-    # latent_vf = policy.mlp_extractor.forward_critic(latent_vf)
     distribution = policy._get_action_dist_from_latent(latent_pi)
     log_prob = distribution.log_prob(actions)
-    # values = policy.value_net(latent_vf)
-    return log_prob, log_prob, distribution.entropy(), gru_states
+    entropy = distribution.entropy()
+    mask = episode_starts<1e-8
+    return log_prob, entropy, gru_states, mask
 
     
 @dataclasses.dataclass(frozen=True)
@@ -133,16 +108,17 @@ class GruBehaviorCloningLossCalculator(BehaviorCloningLossCalculator):
             types.maybe_unwrap_dictobs(obs),
         )
         acts = util.safe_to_tensor(acts)
-        (_, log_prob, entropy, gru_states) = evaluate_actions(
+        acts = acts.to(policy.device)
+        (log_prob, entropy, gru_states, mask) = evaluate_actions(
             policy,
             tensor_obs,  # type: ignore[arg-type]
             acts,
             gru_states,
             dones
         )
-        prob_true_act = th.exp(log_prob).mean()
-        log_prob = log_prob.mean()
-        entropy = entropy.mean() if entropy is not None else None
+        prob_true_act = th.exp(log_prob[mask]).mean()
+        log_prob = log_prob[mask].mean()
+        entropy = entropy[mask].mean() if entropy is not None else None
 
         l2_norms = [th.sum(th.square(w)) for w in policy.parameters()]
         l2_norm = sum(l2_norms) / 2  # divide by 2 to cancel with gradient of square
@@ -164,44 +140,14 @@ class GruBehaviorCloningLossCalculator(BehaviorCloningLossCalculator):
             gru_states = gru_states
         )
 
-class GruBC(algo_base.DemonstrationAlgorithm):
-    """
-    rollout_size_init
-    hidden = zeors 
-    for data in demon:
-        hidden = policy.forward(obs)
-        rollout.add(*data + hidden)
-    """
-
-    """
-    You must know that there didn't use random mechanism to make batch, it means we can use it right now for recurrent!.
-        i.e. We don't need to make batch for recurrent
-    But how to recurrent a hidden state?
-
-    Facebook, they used batch for make hidden state, here is a pseudocode
-        init empty list for stack hidden_state as A
-        for batch in data_generator:
-            _, log_pros, hidden_state, dist_entropy = self.policy.evaluated_actions(batch[obs],
-                                                                                    batch[acts],
-                                                                                    batch['hidden_state'])
-            // skipping change above outputs' shape 
-            input hidden_state into A
-        concat A and transform numpy as torch
-        return A
-    
-    Here is one question
-        1. Here is first hidden state? -> In my opinion, we should add this in BehaviorCloningLossCalculator at __init__ part
-    Note
-        1. Don't think of episode start tensor, i will add this part. 
-        2. Don't consider about reset hidden state, In _process_sequence from Actor-Critic will be reset hidden state by using episode_starts
-    """
+class GRUBC(algo_base.DemonstrationAlgorithm):
     def __init__(
         self,
         *,
         observation_space: gym.Space,
         action_space: gym.Space,
         rng: np.random.Generator,
-        policy: Optional[policies.ActorCriticPolicy] = None,
+        policy: Optional[GruActorCriticPolicy] = None,
         demonstrations: Optional[algo_base.AnyTransitions] = None,
         batch_size: int = 32,
         minibatch_size: Optional[int] = None,
@@ -247,7 +193,7 @@ class GruBC(algo_base.DemonstrationAlgorithm):
         return self._policy
 
     def set_demonstrations(self, demonstrations: algo_base.AnyTransitions) -> None:
-        self._demo_data_loader = algo_base.make_data_loader(
+        self._demo_data_loader = make_data_loader(
             demonstrations,
             self.minibatch_size,
         )
@@ -265,35 +211,6 @@ class GruBC(algo_base.DemonstrationAlgorithm):
         progress_bar: bool = True,
         reset_tensorboard: bool = False,
     ):
-        """Train with supervised learning for some number of epochs.
-
-        Here an 'epoch' is just a complete pass through the expert data loader,
-        as set by `self.set_expert_data_loader()`. Note, that when you specify
-        `n_batches` smaller than the number of batches in an epoch, the `on_epoch_end`
-        callback will never be called.
-
-        Args:
-            n_epochs: Number of complete passes made through expert data before ending
-                training. Provide exactly one of `n_epochs` and `n_batches`.
-            n_batches: Number of batches loaded from dataset before ending training.
-                Provide exactly one of `n_epochs` and `n_batches`.
-            on_epoch_end: Optional callback with no parameters to run at the end of each
-                epoch.
-            on_batch_end: Optional callback with no parameters to run at the end of each
-                batch.
-            log_interval: Log stats after every log_interval batches.
-            log_rollouts_venv: If not None, then this VecEnv (whose observation and
-                actions spaces must match `self.observation_space` and
-                `self.action_space`) is used to generate rollout stats, including
-                average return and average episode length. If None, then no rollouts
-                are generated.
-            log_rollouts_n_episodes: Number of rollouts to generate when calculating
-                rollout stats. Non-positive number disables rollouts.
-            progress_bar: If True, then show a progress bar during training.
-            reset_tensorboard: If True, then start plotting to Tensorboard from x=0
-                even if `.train()` logged to Tensorboard previously. Has no practical
-                effect if `.train()` is being called for the first time.
-        """
         if reset_tensorboard:
             self._bc_logger.reset_tensorboard_steps()
         self._bc_logger.log_epoch(0)
@@ -362,7 +279,6 @@ class GruBC(algo_base.DemonstrationAlgorithm):
             num_samples_so_far,
         ), batch in batches_with_stats:
             obs_tensor: Union[th.Tensor, Dict[str, th.Tensor]]
-            # unwraps the observation if it's a dictobs and converts arrays to tensors
             obs_tensor = types.map_maybe_dict(
                 lambda x: util.safe_to_tensor(x, device=self.policy.device),
                 types.maybe_unwrap_dictobs(batch["obs"]),
@@ -372,13 +288,10 @@ class GruBC(algo_base.DemonstrationAlgorithm):
             training_metrics = self.loss_calculator(self.policy, obs_tensor, acts, gru_states, dones)
             loss = training_metrics.loss * minibatch_size / self.batch_size
             loss.backward()
-            gru_states = training_metrics.gru_states.detach()
 
             batch_num = batch_num * self.minibatch_size // self.batch_size
             if num_samples_so_far % self.batch_size == 0:
                 process_batch()
         if num_samples_so_far % self.batch_size != 0:
-            # if there remains an incomplete batch
             batch_num += 1
             process_batch()
-
